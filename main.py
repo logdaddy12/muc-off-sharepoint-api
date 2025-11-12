@@ -91,3 +91,48 @@ async def get_drives():
             print("Drives Error:", response.text)
             raise HTTPException(status_code=500, detail="Failed to fetch drives")
         return response.json()
+
+@app.get("/sharepoint/search")
+async def search_files(query: str = "", filetype: str = ""):
+    token = await get_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    if not SITE_ID or not DRIVE_ID:
+        raise HTTPException(status_code=400, detail="SITE_ID or DRIVE_ID is not set")
+
+    # Microsoft Graph Search API
+    url = f"{GRAPH_BASE}/sites/{SITE_ID}/drives/{DRIVE_ID}/root/search(q='{query}')"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+
+        if response.status_code != 200:
+            print("Search Error:", response.text)
+            raise HTTPException(status_code=500, detail="Search failed")
+
+        results = response.json()["value"]
+
+        # Filter by file extension (optional)
+        if filetype:
+            results = [f for f in results if f["name"].lower().endswith(filetype.lower())]
+
+        return results
+
+@app.get("/sharepoint/folder/{folder_id}/files")
+async def get_folder_files(folder_id: str):
+    token = await get_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    if not DRIVE_ID:
+        raise HTTPException(status_code=400, detail="DRIVE_ID is not set")
+
+    url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{folder_id}/children"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+
+        if response.status_code != 200:
+            print("Folder Error:", response.text)
+            raise HTTPException(status_code=500, detail="Failed to fetch folder contents")
+
+        return response.json()["value"]
