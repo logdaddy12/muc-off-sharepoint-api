@@ -5,10 +5,12 @@ import os
 from dotenv import load_dotenv
 import pandas as pd
 
+# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
+# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,6 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Environment vars
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
@@ -25,6 +28,7 @@ DRIVE_ID = os.getenv("DRIVE_ID")
 AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
+# Get Graph API token
 async def get_token():
     data = {
         "client_id": CLIENT_ID,
@@ -40,51 +44,21 @@ async def get_token():
             raise HTTPException(status_code=500, detail="Authentication failed")
         return response.json()["access_token"]
 
-@app.get("/sharepoint/siteid")
-async def get_site_id(search: str = "muc-off"):
-    token = await get_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"{GRAPH_BASE}/sites?search={search}"
-
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code != 200:
-            print("Site ID Error:", response.text)
-            raise HTTPException(status_code=500, detail="Failed to fetch site ID")
-        return response.json()
-
+# 📂 List root files/folders
 @app.get("/sharepoint/files")
-async def get_sharepoint_files():
+async def get_root_files():
     token = await get_token()
-
-    if not SITE_ID or not DRIVE_ID:
-        raise HTTPException(status_code=400, detail="SITE_ID or DRIVE_ID not set")
-
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{GRAPH_BASE}/sites/{SITE_ID}/drives/{DRIVE_ID}/root/children"
 
     async with httpx.AsyncClient() as client:
         response = await client.get(url, headers=headers)
         if response.status_code != 200:
-            print("Drive Error:", response.text)
-            raise HTTPException(status_code=500, detail="Failed to fetch files")
+            print("File list error:", response.text)
+            raise HTTPException(status_code=500, detail="Failed to get files")
         return response.json()["value"]
 
-@app.get("/sharepoint/drives")
-async def get_drives():
-    token = await get_token()
-    if not SITE_ID:
-        raise HTTPException(status_code=400, detail="SITE_ID is not set")
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"{GRAPH_BASE}/sites/{SITE_ID}/drives"
-
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code != 200:
-            print("Drives Error:", response.text)
-            raise HTTPException(status_code=500, detail="Failed to fetch drives")
-        return response.json()
-
+# 📂 List contents of a folder by ID (with pagination)
 @app.get("/sharepoint/folder/{folder_id}/files")
 async def get_folder_files(folder_id: str):
     token = await get_token()
@@ -96,13 +70,14 @@ async def get_folder_files(folder_id: str):
         async with httpx.AsyncClient() as client:
             response = await client.get(url, headers=headers)
             if response.status_code != 200:
-                print("Pagination Error:", response.text)
-                raise HTTPException(status_code=500, detail="Failed to fetch folder contents")
+                print("Folder read error:", response.text)
+                raise HTTPException(status_code=500, detail="Failed to get folder contents")
             data = response.json()
             files.extend(data.get("value", []))
             url = data.get("@odata.nextLink")
     return files
 
+# 🔍 Search files by name and/or file type
 @app.get("/sharepoint/search")
 async def search_files(query: str = "", filetype: str = ""):
     token = await get_token()
@@ -112,37 +87,52 @@ async def search_files(query: str = "", filetype: str = ""):
     async with httpx.AsyncClient() as client:
         response = await client.get(url, headers=headers)
         if response.status_code != 200:
-            print("Search Error:", response.text)
+            print("Search error:", response.text)
             raise HTTPException(status_code=500, detail="Search failed")
         results = response.json()["value"]
         if filetype:
             results = [f for f in results if f["name"].lower().endswith(filetype.lower())]
         return results
 
-# 📥 New: Download and parse Excel file content
-@app.get("/sharepoint/file/{item_id}/excel")
-async def read_excel_file(item_id: str):
+# 📊 Read and return supplier data from Excel inside a folder
+@app.get("/sharepoint/folder/{folder_id}/file/{file_name}/excel")
+async def read_excel_from_folder(folder_id: str, file_name: str):
     token = await get_token()
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{item_id}/content"
+    # Get all items in folder
+    url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{folder_id}/children"
 
     async with httpx.AsyncClient() as client:
         response = await client.get(url, headers=headers)
         if response.status_code != 200:
-            print("Download Error:", response.text)
-            raise HTTPException(status_code=500, detail="Failed to download Excel file")
+            raise HTTPException(status_code=500, detail="Failed to read folder")
+        items = response.json().get("value", [])
 
-        # Save temporary Excel file
+    # Match file
+    match = next((item for item in items if item["name"].lower() == file_name.lower()), None)
+    if not match:
+        raise HTTPException(status_code=404, detail=f"File '{file_name}' not found in folder")
+
+    file_id = match["id"]
+    download_url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{file_id}/content"
+
+    # Download file
+    async with httpx.AsyncClient() as client:
+        file_response = await client.get(download_url, headers=headers)
+        if file_response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to download file")
         with open("temp.xlsx", "wb") as f:
-            f.write(response.content)
+            f.write(file_response.content)
 
+    # Parse Excel
     try:
         df = pd.read_excel("temp.xlsx")
         suppliers = df.iloc[:, 0].dropna().unique().tolist()
         return {
             "sample_suppliers": suppliers[:10],
-            "total_suppliers": len(suppliers)
+            "total_suppliers": len(suppliers),
+            "source_file": file_name
         }
     except Exception as e:
-        print("Excel parsing error:", str(e))
-        raise HTTPException(status_code=500, detail="Failed to parse Excel file")
+        print("Excel parse error:", str(e))
+        raise HTTPException(status_code=500, detail="Excel parsing failed")
