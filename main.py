@@ -132,10 +132,15 @@ async def extract_text(site_id: str, drive_id: str, item_id: str, filetype: str 
 
 # 📊 Read Excel from any site/drive
 @app.get("/sharepoint/site/{site_id}/drive/{drive_id}/file/{item_id}/excel")
-async def read_excel(site_id: str, drive_id: str, item_id: str):
+async def read_excel(site_id: str, drive_id: str, item_id: str, cardcode: str = None):
+    """
+    Read Excel and intelligently extract SAP-style supplier or purchase data.
+    Supports optional filtering by CardCode or other key fields.
+    """
     token = await get_token()
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{GRAPH_BASE}/sites/{site_id}/drives/{drive_id}/items/{item_id}/content"
+
     async with httpx.AsyncClient() as client:
         file_resp = await client.get(url, headers=headers, follow_redirects=True)
         if file_resp.status_code != 200:
@@ -147,13 +152,52 @@ async def read_excel(site_id: str, drive_id: str, item_id: str):
 
     try:
         df = pd.read_excel(tmp_path)
-        suppliers = df.iloc[:, 0].dropna().unique().tolist()
     finally:
         os.remove(tmp_path)
 
+    # Normalize column headers (case-insensitive)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Common SAP-related headers
+    sap_keys = {
+        "cardcode": None,
+        "cardname": None,
+        "docnum": None,
+        "docdate": None,
+        "itemcode": None,
+        "dscription": None,
+        "quantity": None,
+        "doctotal": None
+    }
+
+    # Map columns that exist
+    for k in list(sap_keys.keys()):
+        match = [col for col in df.columns if k in col]
+        if match:
+            sap_keys[k] = match[0]
+
+    # Filter by CardCode if provided
+    if cardcode and sap_keys["cardcode"]:
+        df = df[df[sap_keys["cardcode"]].astype(str).str.contains(cardcode, case=False, na=False)]
+
+    # Build structured supplier summary
+    summary = []
+    for _, row in df.head(50).iterrows():  # limit for safety
+        entry = {}
+        if sap_keys["cardcode"]: entry["CardCode"] = str(row[sap_keys["cardcode"]])
+        if sap_keys["cardname"]: entry["CardName"] = str(row[sap_keys["cardname"]])
+        if sap_keys["docnum"]: entry["DocNum"] = str(row[sap_keys["docnum"]])
+        if sap_keys["docdate"]: entry["DocDate"] = str(row[sap_keys["docdate"]])
+        if sap_keys["doctotal"]: entry["DocTotal"] = float(row[sap_keys["doctotal"]]) if not pd.isna(row[sap_keys["doctotal"]]) else None
+        if sap_keys["dscription"]: entry["ItemDesc"] = str(row[sap_keys["dscription"]])
+        if sap_keys["quantity"]: entry["Quantity"] = str(row[sap_keys["quantity"]])
+        summary.append(entry)
+
     return {
-        "sample_suppliers": suppliers[:10],
-        "total_suppliers": len(suppliers)
+        "matched_cardcode": cardcode or None,
+        "total_records": len(df),
+        "sap_fields_detected": [k for k, v in sap_keys.items() if v],
+        "sample_records": summary
     }
 
 
