@@ -308,29 +308,74 @@ async def extract_text(site_id: str, drive_id: str, item_id: str, filetype: str 
 # =========================
 
 def _detect_columns(df: pd.DataFrame) -> Dict[str, str]:
-    """Detects SAP-style columns dynamically (case-insensitive, substring matches)."""
-    cols = [c.strip().lower() for c in df.columns]
+    """
+    Detects SAP-style columns dynamically (case-insensitive, substring and synonym matches).
+    Works for both supplier (AP) and customer (AR) exports.
+    """
+    cols = [str(c).strip().lower() for c in df.columns]
     mapping: Dict[str, str] = {}
 
     def find(*keys: str) -> Optional[str]:
+        """Return first matching column for any key fragment."""
         for k in keys:
             for c in cols:
+                # Match exact or substring (case-insensitive)
                 if k in c:
                     return c
         return None
 
-    mapping["cardcode"] = find("cardcode", "vendor", "bpcode", "supplierid")
-    mapping["cardname"] = find("cardname", "vendorname", "bpname", "suppliername")
-    mapping["docnum"]   = find("docnum", "docentry", "invoice", "po_no", "po number", "doc no")
-    mapping["date"]     = find("docdate", "taxdate", "posting", "date")
-    # Prefer LineTotal/DocTotal over generic 'total'/'amount'
-    mapping["total"]    = find("linetotal", "doctotal", "total amount", "amount", "grandtotal", "total")
+    # === Business Partner Fields (AP + AR) ===
+    mapping["cardcode"] = find(
+        "cardcode", "vendor", "bpcode", "supplierid", "customer", "clientcode", "debitor", "partnercode"
+    )
+    mapping["cardname"] = find(
+        "cardname", "vendorname", "bpname", "suppliername", "customername", "clientname", "debitorname", "partnername"
+    )
 
-    # Optional useful fields
-    mapping["qty"]      = find("quantity", "qty", "openqty", "baseqty")
-    mapping["item"]     = find("itemcode", "dscription", "material", "sku", "product", "item")
+    # === Document Identifiers ===
+    mapping["docnum"] = find(
+        "docnum", "docentry", "invoice", "invno", "invnum", "documentnumber", "po_no",
+        "po number", "doc no", "order", "salesorder", "purchaseorder"
+    )
 
+    # === Dates ===
+    mapping["date"] = find(
+        "docdate", "taxdate", "postingdate", "posting", "duedate", "createdate", "date", "trandate"
+    )
+
+    # === Totals and Amounts (prefer detailed fields) ===
+    mapping["total"] = find(
+        "linetotal", "doctotal", "totalamount", "amount", "grandtotal", "total", "netvalue",
+        "grossamount", "debit", "credit", "balance", "priceaftervat", "netamt"
+    )
+
+    # === Quantities ===
+    mapping["qty"] = find(
+        "quantity", "qty", "openqty", "baseqty", "shipqty", "delqty", "invoicedqty", "orderedqty"
+    )
+
+    # === Items / Materials ===
+    mapping["item"] = find(
+        "itemcode", "item", "dscription", "description", "material", "sku", "product", "partnumber", "materialcode"
+    )
+
+    # === Financial Details (optional enrichments) ===
+    mapping["tax"] = find("tax", "vat", "gst", "taxamt", "taxamount")
+    mapping["discount"] = find("disc", "discount", "discperc", "discamt", "discountamount")
+    mapping["currency"] = find("currency", "curr", "currcode")
+    mapping["warehouse"] = find("whscode", "warehouse", "location")
+    mapping["costcenter"] = find("costcenter", "profitcenter", "costctr", "pc", "division")
+    mapping["cardtype"] = find("cardtype", "bptype", "businesspartner", "bpgroup")
+
+    # === User-defined (custom) fields ===
+    for c in cols:
+        if c.startswith("u_") and "userfields" not in mapping:
+            mapping["userfields"] = c
+            break
+
+    # Filter out None values
     return {k: v for k, v in mapping.items() if v}
+
 
 def _parse_datesafe(s: Optional[str]) -> Optional[datetime]:
     if not s:
