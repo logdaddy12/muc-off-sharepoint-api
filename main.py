@@ -388,20 +388,35 @@ async def analyze_excel(
     drive_id: str,
     item_id: str,
     cardcode: Optional[str] = None,
+    keyword: Optional[str] = None,  # NEW: free-text search (e.g., "WatchGuard")
     min_total: Optional[float] = Query(default=None, ge=0),
     max_total: Optional[float] = Query(default=None, ge=0),
     start_date: Optional[str] = None,  # YYYY-MM-DD
     end_date: Optional[str] = None,    # YYYY-MM-DD
 ):
+    """
+    Analyze SAP-style Excel data with smart filters and keyword search.
+
+    Features:
+    - Detects SAP-like fields (CardCode, CardName, DocNum, DocDate, DocTotal, etc.)
+    - Supports supplier/customer totals, date/amount filters
+    - NEW: keyword search inside item descriptions or supplier names
+    - Returns summarized totals grouped by business partner
+    """
+    # -------------------------
+    # Input validation & auth
+    # -------------------------
     site_id = _validate_id(site_id, "site_id")
     drive_id = _validate_id(drive_id, "drive_id")
     item_id = _validate_id(item_id, "item_id")
     enforce_site_allowed(site_id)
 
-    # Fetch file
+    # -------------------------
+    # Fetch Excel file from Graph
+    # -------------------------
     content = await graph_get_bytes(f"/sites/{site_id}/drives/{drive_id}/items/{item_id}/content")
 
-    # Read Excel to temp
+    # Save to temp and load into pandas
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -421,6 +436,7 @@ async def analyze_excel(
         return {
             "filtered_by": {
                 "cardcode": cardcode,
+                "keyword": keyword,
                 "min_total": min_total,
                 "max_total": max_total,
                 "start_date": start_date,
@@ -432,27 +448,36 @@ async def analyze_excel(
             "total_records": 0,
         }
 
+    # -------------------------
     # Normalize headers
+    # -------------------------
     df.columns = [str(c).strip().lower() for c in df.columns]
     colmap = _detect_columns(df)
 
-    # Normalize numeric totals
+    # -------------------------
+    # Normalize numeric & date fields
+    # -------------------------
     if "total" in colmap:
         df[colmap["total"]] = pd.to_numeric(df[colmap["total"]], errors="coerce")
 
-    # Normalize dates
     if "date" in colmap:
         df[colmap["date"]] = pd.to_datetime(df[colmap["date"]], errors="coerce")
 
-    # Filters
+    # -------------------------
+    # Apply filters
+    # -------------------------
+
+    # Filter by CardCode (supplier/customer code)
     if cardcode and "cardcode" in colmap:
         df = df[df[colmap["cardcode"]].astype(str).str.contains(cardcode, case=False, na=False)]
 
+    # Filter by numeric totals
     if min_total is not None and "total" in colmap:
         df = df[df[colmap["total"]] >= float(min_total)]
     if max_total is not None and "total" in colmap:
         df = df[df[colmap["total"]] <= float(max_total)]
 
+    # Filter by date range
     sd = _parse_datesafe(start_date)
     ed = _parse_datesafe(end_date)
     if sd and "date" in colmap:
@@ -460,10 +485,22 @@ async def analyze_excel(
     if ed and "date" in colmap:
         df = df[df[colmap["date"]] <= ed]
 
-    total_records = int(len(df))
+    # NEW: Keyword search (e.g., “WatchGuard” in item description or supplier name)
+    if keyword:
+        kw = keyword.strip().lower()
+        text_cols = [colmap.get(k) for k in ["item", "dscription", "cardname"] if colmap.get(k)]
+        if text_cols:
+            mask = pd.Series(False, index=df.index)
+            for c in text_cols:
+                mask |= df[c].astype(str).str.lower().str.contains(kw, na=False)
+            df = df[mask]
 
-    # Supplier totals
+    # -------------------------
+    # Aggregate totals per business partner
+    # -------------------------
+    total_records = int(len(df))
     supplier_totals: List[Dict[str, Any]] = []
+
     if "cardcode" in colmap and "total" in colmap and total_records > 0:
         group_keys = [colmap["cardcode"]]
         if "cardname" in colmap:
@@ -475,7 +512,6 @@ async def analyze_excel(
             .reset_index()
         )
 
-        # Rename to stable keys
         renames = {
             colmap["cardcode"]: "CardCode",
             colmap.get("cardname", colmap["cardcode"]): "CardName",
@@ -483,13 +519,19 @@ async def analyze_excel(
         }
         supplier_totals = grouped.rename(columns=renames).to_dict(orient="records")
 
-    # Sample preview (limited, to avoid PII leakage)
-    preview_cols = [colmap.get(k) for k in ["cardcode", "cardname", "docnum", "total", "date"] if colmap.get(k)]
+    # -------------------------
+    # Prepare sample preview (PII-safe)
+    # -------------------------
+    preview_cols = [colmap.get(k) for k in ["cardcode", "cardname", "docnum", "total", "date", "item"] if colmap.get(k)]
     sample_records = df[preview_cols].head(10).to_dict(orient="records") if preview_cols else []
 
+    # -------------------------
+    # Return structured response
+    # -------------------------
     return {
         "filtered_by": {
             "cardcode": cardcode,
+            "keyword": keyword,
             "min_total": min_total,
             "max_total": max_total,
             "start_date": start_date,
